@@ -81,12 +81,10 @@ def analyze(saves_dir, output, min_appearances):
                  [(r.relic, r.runs, r.wins, f"{r.win_rate}%") for _, r in rwr.iterrows()],
                  ["Relic", "Runs", "Wins", "Win Rate"])
 
-    # Try to generate Plotly dashboard if available
+    # Generate dashboard
     try:
         from sts2_analysis.viz.dashboard import overview_dashboard
-        card_df = card_pick_rates(runs)
-        fig = overview_dashboard(df, card_df, rwr)
-        fig.write_html(output)
+        overview_dashboard(runs, output)
         print(f"\nDashboard saved to: {output}")
     except ImportError:
         print("\n[info] Install plotly to generate the HTML dashboard: pip install plotly")
