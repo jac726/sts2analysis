@@ -4,7 +4,7 @@ Field names are derived directly from the .run JSON schema (schema_version 8).
 """
 from dataclasses import dataclass, field
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -18,6 +18,7 @@ class CardEntry:
         return cls(
             id=d.get("id", ""),
             floor_added_to_deck=d.get("floor_added_to_deck", 0),
+            upgraded=d.get("upgraded", False),
         )
 
 
@@ -40,7 +41,7 @@ class CardChoice:
     @classmethod
     def from_dict(cls, d: dict, floor: int = 0) -> "CardChoice":
         return cls(
-            card_id=d.get("card", {}).get("id", ""),
+            card_id=(d.get("card") or {}).get("id", ""),
             was_picked=d.get("was_picked", False),
             floor=floor,
         )
@@ -68,7 +69,8 @@ class FloorStats:
 
     @classmethod
     def from_dict(cls, d: dict, floor: int, act: int) -> "FloorStats":
-        ps = d.get("player_stats", [{}])[0] if d.get("player_stats") else {}
+        player_stats = (d.get("player_stats") or [{}])
+        ps = player_stats[0] if player_stats else {}
         rooms = d.get("rooms", [])
         encounter_id = None
         turns_taken = None
@@ -128,7 +130,7 @@ class Run:
     @property
     def datetime(self) -> Optional[datetime]:
         if self.start_time:
-            return datetime.fromtimestamp(self.start_time)
+            return datetime.fromtimestamp(self.start_time, tz=timezone.utc)
         return None
 
     @property
@@ -155,13 +157,22 @@ class Run:
         return choices
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Run":
-        player = data.get("players", [{}])[0]
+    def from_dict(cls, data: dict, *, keep_raw: bool = False) -> "Run":
+        players = (data.get("players") or [{}])
+        player = players[0] if players else {}
+
+        # Safely get map_point_history to fix both CRASH-5 and PERF-1
+        mph = (data.get("map_point_history") or [])
+
         floor_history = []
-        for act_idx, act_floors in enumerate(data.get("map_point_history", [])):
+        prefix = 0
+        for act_idx, act_floors in enumerate(mph):
+            if not act_floors:  # Handle null/empty acts
+                continue
             for floor_idx, floor_data in enumerate(act_floors):
-                global_floor = sum(len(a) for a in data["map_point_history"][:act_idx]) + floor_idx + 1
+                global_floor = prefix + floor_idx + 1
                 floor_history.append(FloorStats.from_dict(floor_data, global_floor, act_idx + 1))
+            prefix += len(act_floors)
 
         return cls(
             win=data.get("win", False),
@@ -173,15 +184,15 @@ class Run:
             run_time=data.get("run_time", 0),
             start_time=data.get("start_time", 0),
             schema_version=data.get("schema_version", 0),
-            acts=data.get("acts", []),
-            modifiers=data.get("modifiers", []),
+            acts=(data.get("acts") or []),
+            modifiers=(data.get("modifiers") or []),
             killed_by_encounter=data.get("killed_by_encounter", ""),
             killed_by_event=data.get("killed_by_event", ""),
             character=player.get("character", ""),
-            deck=[CardEntry.from_dict(c) for c in player.get("deck", [])],
-            relics=[RelicEntry.from_dict(r) for r in player.get("relics", [])],
-            potions=[p.get("id", "") for p in player.get("potions", [])],
+            deck=[CardEntry.from_dict(c) for c in (player.get("deck") or [])],
+            relics=[RelicEntry.from_dict(r) for r in (player.get("relics") or [])],
+            potions=[p.get("id", "") for p in (player.get("potions") or [])],
             floor_history=floor_history,
             source_file=data.get("_source_file", ""),
-            raw=data,
+            raw=data if keep_raw else {},
         )

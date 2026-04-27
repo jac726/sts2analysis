@@ -35,3 +35,6 @@ data/sample_saves/*.sav
 # OS
 .DS_Store
 Thumbs.db
+
+# Documentation (local notes, analysis, etc - not for commit)
+md/

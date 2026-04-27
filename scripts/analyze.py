@@ -60,7 +60,8 @@ def analyze(saves_dir, output, min_appearances):
         print("No .run files found.")
         return
 
-    runs = [Run.from_dict(r) for r in raw]
+    # Skip co-op runs where we can't identify which player's data is ours (CORRUPT-4)
+    runs = [Run.from_dict(r) for r in raw if not (r.get("game_mode") == "coop" or len(r.get("players", [])) > 1)]
     df = runs_to_dataframe(runs)
     s = summary_stats(df)
 
@@ -95,11 +96,22 @@ def analyze(saves_dir, output, min_appearances):
 @click.option("--n", default=1, help="Number of run files to inspect")
 def inspect(saves_dir, n):
     """Print raw keys from save files — useful when exploring new schema fields."""
-    raw = load_all_runs(saves_dir)
-    if not raw:
-        print("No .run files found.")
-        return
-    for i, run_data in enumerate(raw[:n]):
+    # PERF-7: Stream from glob and break after n instead of loading all
+    from sts2_analysis.parser.save_parser import load_run
+    from pathlib import Path
+    saves_dir = Path(saves_dir)
+    count = 0
+    for path in sorted(saves_dir.glob("*.run")):
+        if count >= n:
+            break
+        try:
+            run_data = load_run(path)
+            count += 1
+        except Exception as e:
+            print(f"[warn] Could not parse {path.name}: {e}")
+            continue
+        # Move the loop body outside
+        i = count - 1
         print(f"\n=== {Path(run_data.get('_source_file','')).name} ===")
         for k, v in run_data.items():
             if k == "_source_file":

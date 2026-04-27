@@ -4,6 +4,7 @@ Save files are plain JSON with schema_version tracking.
 Default save location: Steam/userdata/<steam_id>/2868840/remote/profile1/saves/history/
 """
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +25,12 @@ def load_all_runs(saves_dir: str | Path) -> list[dict[str, Any]]:
         try:
             runs.append(load_run(path))
         except Exception as e:
-            print(f"[warn] Could not parse {path.name}: {e}")
+            print(f"[warn] Could not parse {path.name}: {e}", file=sys.stderr)  # STYLE: warn to stderr
     return runs
 
 
 def find_default_saves_dir() -> Path | None:
-    """Try to find the STS2 saves directory automatically on Windows."""
+    """Try to find the STS2 saves directory automatically on Windows. Note: Mac/Linux not supported. (STYLE)"""
     import os
     steam_base = Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Steam/userdata"
     if not steam_base.exists():

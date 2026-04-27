@@ -36,6 +36,17 @@ def win_rate_by(df: pd.DataFrame, group_by: str) -> pd.DataFrame:
 
 
 def summary_stats(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {
+            "total_runs": 0,
+            "total_wins": 0,
+            "win_rate_pct": 0.0,
+            "total_hours": 0.0,
+            "avg_run_time_min": 0.0,
+            "avg_floors": 0.0,
+            "characters_played": 0,
+            "most_played_char": None,
+        }
     return {
         "total_runs": len(df),
         "total_wins": int(df["win"].sum()),

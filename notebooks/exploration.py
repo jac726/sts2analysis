@@ -33,10 +33,12 @@ plt.rcParams["figure.figsize"] = (12, 5)
 
 # %%
 # SAVES_DIR = r"C:\Program Files (x86)\Steam\userdata\YOUR_STEAM_ID\2868840\remote\profile1\saves\history"
+# NOTE: Real Steam ID committed here; consider using env var (see line 35) (STYLE)
 SAVES_DIR = r"C:\Program Files (x86)\Steam\userdata\137814448\2868840\remote\profile1\saves\history"
 
 raw = load_all_runs(SAVES_DIR)
-runs = [Run.from_dict(r) for r in raw]
+# Skip co-op runs where we can't identify which player's data is ours (CORRUPT-4)
+runs = [Run.from_dict(r) for r in raw if not (r.get("game_mode") == "coop" or len(r.get("players", [])) > 1)]
 df = runs_to_dataframe(runs)
 
 print(f"Loaded {len(runs)} runs")

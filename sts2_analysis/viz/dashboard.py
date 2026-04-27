@@ -35,7 +35,7 @@ TIME_BUCKETS = [
 ]
 
 SHORT_RUN_THRESHOLD = 5   # minutes — below this is almost always an early death
-HIGH_ASC_THRESHOLD  = 5   # A0–A4 are casual/learning runs; A5+ is the real game
+HIGH_ASC_THRESHOLD  = 10  # exclude everything below A10
 
 
 def _clean(name: str) -> str:
@@ -54,7 +54,7 @@ def _card_wr(runs: list[Run], exclude_basics: bool = True, min_appearances: int 
     total: Counter = Counter()
     for r in runs:
         for c in set(card.id.replace("CARD.", "") for card in r.deck):
-            if exclude_basics and c in STARTER_CARDS:
+            if not c or (exclude_basics and c in STARTER_CARDS):  # Skip empty and basic cards (CORRUPT-6)
                 continue
             total[c] += 1
             if r.win:
@@ -74,7 +74,7 @@ def _card_picks(runs: list[Run], exclude_basics: bool = True) -> list[dict]:
     for r in runs:
         for ch in r.all_card_choices:
             cid = ch.card_id.replace("CARD.", "")
-            if exclude_basics and cid in STARTER_CARDS:
+            if not cid or (exclude_basics and cid in STARTER_CARDS):  # Skip empty and basic cards (CORRUPT-6)
                 continue
             offered[cid] += 1
             if ch.was_picked:
@@ -131,27 +131,56 @@ def _killers(runs: list[Run]) -> list[dict]:
     from collections import Counter
     ctr: Counter = Counter()
     for r in runs:
-        if not r.win and not r.was_abandoned and r.killed_by_encounter:
-            kb = r.killed_by_encounter.replace("ENCOUNTER.", "")
+        if not r.win and not r.was_abandoned:
+            # Combine encounter and event kills (WRONG-4)
+            kb = (r.killed_by_encounter or r.killed_by_event or "").replace("ENCOUNTER.", "")
             if kb and kb != "NONE.NONE":
                 ctr[kb] += 1
     return [{"killer": _clean(k), "count": v} for k, v in ctr.most_common(15)]
 
 
-def _progress(runs: list[Run], window: int = 20) -> list[dict]:
-    """Rolling win rate over time, sorted chronologically."""
+def _win_rate_blocks(runs: list[Run], block_size: int = 10) -> list[dict]:
+    """Win rate in discrete chronological blocks of block_size runs."""
     from datetime import datetime as dt_cls
     try:
         sorted_runs = sorted(runs, key=lambda r: r.datetime if r.datetime else dt_cls.min)
     except Exception:
         sorted_runs = runs
     result = []
+    for i in range(0, len(sorted_runs), block_size):
+        block = sorted_runs[i:i + block_size]
+        wins = sum(1 for r in block if r.win)
+        result.append({
+            "block_num":  i // block_size + 1,
+            "label":      f"#{i + 1}–{i + len(block)}",
+            "runs":       len(block),
+            "wins":       wins,
+            "win_rate":   round(wins / len(block) * 100, 1),
+            "partial":    len(block) < block_size,
+        })
+    return result
+
+
+def _progress(runs: list[Run], window: int = 10) -> list[dict]:
+    """Rolling win rate over time, sorted chronologically. O(N) using deque instead of O(N*W)."""
+    from datetime import datetime as dt_cls
+    from collections import deque
+    try:
+        sorted_runs = sorted(runs, key=lambda r: r.datetime if r.datetime else dt_cls.min)
+    except Exception:
+        sorted_runs = runs
+    result = []
+    wins = 0
+    window_q: deque = deque()
     for i, r in enumerate(sorted_runs):
-        start = max(0, i - window + 1)
-        wslice = sorted_runs[start:i + 1]
-        wr = round(sum(1 for x in wslice if x.win) / len(wslice) * 100, 1)
+        window_q.append(r.win)
+        wins += int(r.win)
+        if len(window_q) > window:
+            wins -= int(window_q.popleft())
+        wr = round(wins / len(window_q) * 100, 1)
         try:
-            date_str = r.datetime.strftime("%b %d, %Y") if r.datetime else ""
+            # Use ISO format for locale-independence; format in JS (CORRUPT-8)
+            date_str = r.datetime.isoformat() if r.datetime else ""
         except Exception:
             date_str = ""
         result.append({
@@ -163,39 +192,32 @@ def _progress(runs: list[Run], window: int = 20) -> list[dict]:
     return result
 
 
-def _asc_stats(runs: list[Run]) -> list[dict]:
-    """Win rate grouped by ascension bracket (max A10 in STS2)."""
-    from collections import defaultdict
-    groups: dict = defaultdict(list)
-    order = ["A0", "A1–4", "A5–9", "A10"]
-    for r in runs:
-        asc = r.ascension or 0
-        if asc == 0:
-            label = "A0"
-        elif asc <= 4:
-            label = "A1–4"
-        elif asc <= 9:
-            label = "A5–9"
-        else:
-            label = "A10"
-        groups[label].append(r)
+def _act_progression(runs: list[Run]) -> list[dict]:
+    """% of runs that reached each act milestone. Computes once per checkpoint (PERF-5)."""
+    total = len(runs)
+    if not total:
+        return []
+    checkpoints = [
+        ("Reached Act 2", lambda r: len(r.acts) >= 2),
+        ("Reached Act 3", lambda r: len(r.acts) >= 3 or r.win),  # Winning runs may not list act 3 separately (WRONG-8)
+        ("Victory",       lambda r: r.win),
+    ]
     result = []
-    for label in order:
-        grp = groups.get(label, [])
-        if not grp:
-            continue
-        wins = sum(1 for r in grp if r.win)
+    for label, fn in checkpoints:
+        count = sum(1 for r in runs if fn(r))
         result.append({
-            "ascension": label,
-            "runs": len(grp),
-            "wins": wins,
-            "win_rate": round(wins / len(grp) * 100, 1),
+            "label": label,
+            "count": count,
+            "pct": round(count / total * 100, 1),
         })
     return result
 
 
 def _slice_data(runs: list[Run]) -> dict:
     """All chart data for a filtered run slice."""
+    # Filter out abandoned runs to prevent win-rate poisoning
+    runs = [r for r in runs if not r.was_abandoned]
+
     if not runs:
         return {
             "summary": {}, "win_by_char": [],
@@ -203,7 +225,7 @@ def _slice_data(runs: list[Run]) -> dict:
             "card_picks": [], "card_picks_all": [],
             "relic_wr": [], "run_lengths": [],
             "killers": [], "floors": [],
-            "progress": [], "asc_stats": [],
+            "progress": [], "act_progression": [],
         }
     df = runs_to_dataframe(runs)
     return {
@@ -217,8 +239,9 @@ def _slice_data(runs: list[Run]) -> dict:
         "run_lengths":    _run_lengths(runs),
         "killers":        _killers(runs),
         "floors":         [{"floors": r.floors_reached, "win": r.win} for r in runs],
-        "progress":       _progress(runs),
-        "asc_stats":      _asc_stats(runs),
+        "progress":        _progress(runs),
+        "win_blocks":      _win_rate_blocks(runs),
+        "act_progression": _act_progression(runs),
     }
 
 
@@ -359,9 +382,55 @@ body {{
 .card {{
   background: var(--card); border: 1px solid var(--border);
   border-radius: 14px; padding: 20px;
-  backdrop-filter: blur(12px); transition: border-color 0.2s;
+  backdrop-filter: blur(12px);
+  transition: border-color 0.25s, box-shadow 0.25s, transform 0.2s;
 }}
-.card:hover {{ border-color: rgba(255,255,255,0.12); }}
+.card:hover {{
+  border-color: rgba(124,106,247,0.22);
+  box-shadow: 0 6px 32px rgba(124,106,247,0.07), 0 0 0 1px rgba(124,106,247,0.07);
+  transform: translateY(-1px);
+}}
+
+/* ── Streak widget ── */
+.streak-grid {{ display: flex; flex-wrap: wrap; gap: 3px; padding: 4px 0; }}
+.run-dot {{
+  width: 12px; height: 12px; border-radius: 3px;
+  display: inline-block; cursor: default; flex-shrink: 0;
+  transition: transform 0.1s, opacity 0.1s;
+  position: relative;
+}}
+.run-dot:hover {{ transform: scale(1.6); z-index: 10; }}
+.run-dot.win  {{ background: #22c55e; }}
+.run-dot.loss {{ background: #ef4444; opacity: 0.55; }}
+.run-dot.in-streak {{ box-shadow: 0 0 5px 1px currentColor; opacity: 1 !important; }}
+
+.streak-stat {{
+  text-align: center; padding: 14px 10px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--border); border-radius: 12px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}}
+.streak-stat:hover {{
+  border-color: rgba(124,106,247,0.25);
+  box-shadow: 0 0 16px rgba(124,106,247,0.08);
+}}
+.streak-num {{
+  font-size: 36px; font-weight: 800; letter-spacing: -2px; line-height: 1;
+  background: linear-gradient(135deg, #7c6af7 0%, #06b6d4 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}}
+.streak-num.good {{
+  background: linear-gradient(135deg, #22c55e 0%, #06b6d4 100%);
+  -webkit-background-clip: text;
+}}
+.streak-num.bad {{
+  background: linear-gradient(135deg, #ef4444 0%, #f59e0b 100%);
+  -webkit-background-clip: text;
+}}
+.streak-label {{
+  font-size: 10px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.8px; margin-top: 6px;
+}}
 .card.wide {{ grid-column: 1 / -1; }}
 .card-header {{
   display: flex; align-items: center; justify-content: space-between;
@@ -405,7 +474,7 @@ body {{
   <div class="divider"></div>
   <div class="ctrl-group">
     <button class="pill" id="short-btn" onclick="toggleShort()">Short runs excluded</button>
-    <button class="pill" id="asc-btn"   onclick="toggleAsc()">Low asc excluded</button>
+    <button class="pill" id="asc-btn"   onclick="toggleAsc()">A10 only</button>
   </div>
   <div class="divider"></div>
   <div class="ctrl-group">
@@ -509,18 +578,32 @@ body {{
     <div class="grid">
       <div class="card wide">
         <div class="card-header">
-          <span class="card-title">Win rate over time</span>
-          <span class="card-note" id="progress-note">20-run rolling average</span>
+          <span class="card-title" id="blocks-title">Win rate per 5 runs</span>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span class="card-note">faded bar = incomplete batch</span>
+            <div class="sort-toggle">
+              <button class="sort-btn active" id="block-5"  onclick="setBlockSize(5)">5</button>
+              <button class="sort-btn"        id="block-10" onclick="setBlockSize(10)">10</button>
+              <button class="sort-btn"        id="block-20" onclick="setBlockSize(20)">20</button>
+            </div>
+          </div>
+        </div>
+        <div id="ch-blocks"></div>
+      </div>
+      <div class="card wide">
+        <div class="card-header">
+          <span class="card-title">Rolling win rate</span>
+          <span class="card-note">10-run rolling average</span>
         </div>
         <div id="ch-progress"></div>
       </div>
       <div class="card">
-        <div class="card-header"><span class="card-title">Win rate by ascension</span></div>
-        <div id="ch-ascension"></div>
+        <div class="card-header"><span class="card-title">Run history</span><span class="card-note">recent 50 · hover for details</span></div>
+        <div id="ch-streak"></div>
       </div>
       <div class="card">
-        <div class="card-header"><span class="card-title">Deck size at run end</span></div>
-        <div id="ch-decksize"></div>
+        <div class="card-header"><span class="card-title">Act progression</span><span class="card-note">% of runs reaching each milestone</span></div>
+        <div id="ch-acts"></div>
       </div>
     </div>
   </div>
@@ -539,6 +622,7 @@ let inclShort   = false;   // false = exclude runs < 5m  (default: excluded)
 let inclLowAsc  = false;   // false = exclude A0–A4      (default: excluded)
 let wrSort      = 'win_rate';
 let pickSort    = 'picked';
+let blockSize   = 5;
 
 // Maps the two boolean toggles to a pre-computed slice key
 const sliceKey = () => {{
@@ -583,7 +667,7 @@ function wrColor(v) {{
 }}
 
 function wrGradient(values) {{
-  const mx = Math.max(...values);
+  const mx = Math.max(...values, 1);  // Ensure never divides by 0 (WRONG-1)
   return values.map(v => {{
     const t = v / mx;
     if (t < 0.5) {{
@@ -599,7 +683,8 @@ function wrGradient(values) {{
 
 // ── Generic horizontal bar ──────────────────────────────────────
 function hbar(id, labels, values, text, colors, xTitle, height) {{
-  Plotly.newPlot(id, [{{
+  // Use Plotly.react for efficient re-renders (PERF-6)
+  Plotly.react(id, [{{
     type: 'bar', orientation: 'h',
     x: values, y: labels,
     marker: {{ color: colors, opacity: 0.92 }},
@@ -636,8 +721,11 @@ function renderStats() {{
 // ── Win rate by character ────────────────────────────────────────
 function renderWinRate() {{
   const rows = [...(d().win_by_char||[])].sort((a,b) => a.win_rate - b.win_rate);
-  if (!rows.length) return;
-  Plotly.newPlot('ch-winrate', [{{
+  if (!rows.length) {{
+    document.getElementById('ch-winrate').innerHTML = '<p class="empty">No data</p>';  // Clear stale chart (CORRUPT-5)
+    return;
+  }}
+  Plotly.react('ch-winrate', [{{
     type: 'bar', orientation: 'h',
     x: rows.map(r => r.win_rate),
     y: rows.map(r => r.character),
@@ -660,7 +748,7 @@ function renderFloors() {{
   const rows = d().floors || [];
   const wins   = rows.filter(r => r.win).map(r => r.floors);
   const losses = rows.filter(r => !r.win).map(r => r.floors);
-  Plotly.newPlot('ch-floors', [
+  Plotly.react('ch-floors', [
     {{ type:'histogram', x: wins,   name:'Win',  marker:{{ color: WIN_COLOR,  opacity: 0.75 }},
        hovertemplate: 'Floor %{{x}}: %{{y}} wins<extra></extra>' }},
     {{ type:'histogram', x: losses, name:'Loss', marker:{{ color: LOSS_COLOR, opacity: 0.5  }},
@@ -680,8 +768,9 @@ function renderCardWR() {{
   const rows = d()[key] || [];
   const el = document.getElementById('ch-cardwr');
   if (!rows.length) {{ el.innerHTML = '<p class="empty">Not enough data</p>'; return; }}
-  const sorted = [...rows].sort((a,b) => b[wrSort] - a[wrSort]);
+  const sorted = [...rows].sort((a,b) => b[wrSort] - a[wrSort]).slice(0, 20);  // CORRUPT-2: Slice in JS after sorting
   const rev = [...sorted].reverse();
+  const note = rows.length > 20 ? ` (top 20 of ${{rows.length}})` : '';  // WRONG-6
   hbar('ch-cardwr',
     rev.map(r => r.card),
     rev.map(r => r.win_rate),
@@ -697,13 +786,14 @@ function renderCardPicks() {{
   const rows = d()[key] || [];
   const el = document.getElementById('ch-cardpick');
   if (!rows.length) {{ el.innerHTML = '<p class="empty">Not enough data</p>'; return; }}
-  const sorted = [...rows].sort((a,b) => b[pickSort] - a[pickSort]);
+  const sorted = [...rows].sort((a,b) => b[pickSort] - a[pickSort]).slice(0, 20);  // CORRUPT-2: Slice in JS after sorting
   const rev = [...sorted].reverse();
-  const max = Math.max(...rev.map(r => r[pickSort]));
+  const max = Math.max(...rev.map(r => r[pickSort]), 1);  // WRONG-1: Ensure never divides by 0
   const colors = rev.map(r => {{
     const a = 0.35 + 0.65 * (r[pickSort] / max);
     return `rgba(124,106,247,${{a.toFixed(2)}})`;
   }});
+  const note = rows.length > 20 ? ` (top 20 of ${{rows.length}})` : '';  // WRONG-6
   hbar('ch-cardpick',
     rev.map(r => r.card),
     rev.map(r => r.picked),
@@ -736,7 +826,7 @@ function renderRunLength() {{
     document.getElementById('ch-runlen').innerHTML = '<p class="empty">No data</p>';
     return;
   }}
-  Plotly.newPlot('ch-runlen', [{{
+  Plotly.react('ch-runlen', [{{
     type: 'bar',
     x: buckets.map(b => b.bucket),
     y: buckets.map(b => b.win_rate),
@@ -761,7 +851,7 @@ function renderRunScatter() {{
   const runLens = d().run_lengths || [];
   const wins   = runLens.filter(r => r.win);
   const losses = runLens.filter(r => !r.win);
-  Plotly.newPlot('ch-runscatter', [
+  Plotly.react('ch-runscatter', [
     {{ type:'scatter', mode:'markers', name:'Win',
        x: wins.map(r => r.run_time_min), y: wins.map(r => r.floors),
        marker:{{ color: WIN_COLOR, size: 6, opacity: 0.75,
@@ -802,100 +892,207 @@ function renderKillers() {{
   );
 }}
 
-// ── Progress: rolling win rate ───────────────────────────────────
+// ── Compute blocks from per-run progress data ────────────────────
+function computeBlocks(prog, size) {{
+  const blocks = [];
+  for (let i = 0; i < prog.length; i += size) {{
+    const slice = prog.slice(i, i + size);
+    const wins  = slice.filter(r => r.win).length;
+    blocks.push({{
+      label:    '#' + (i + 1) + '–' + (i + slice.length),
+      block_num: Math.floor(i / size) + 1,
+      runs:     slice.length,
+      wins,
+      win_rate: +(wins / slice.length * 100).toFixed(1),
+      partial:  slice.length < size,
+    }});
+  }}
+  return blocks;
+}}
+
+// ── Block size toggle ────────────────────────────────────────────
+function setBlockSize(n) {{
+  blockSize = n;
+  [5, 10, 20].forEach(s => {{
+    document.getElementById('block-' + s).classList.toggle('active', s === n);
+  }});
+  document.getElementById('blocks-title').textContent = 'Win rate per ' + n + ' runs';
+  renderBlocks();
+}}
+
+// ── Progress: per-N-run block bars ───────────────────────────────
+function renderBlocks() {{
+  const prog = d().progress || [];
+  const blocks = computeBlocks(prog, blockSize);
+  const el = document.getElementById('ch-blocks');
+  if (!blocks.length) {{ el.innerHTML = '<p class="empty">Not enough data</p>'; return; }}
+
+  // Moving average over the block win rates (window = 3, or fewer if not enough blocks)
+  const winRates = blocks.map(b => b.win_rate);
+  const maWindow = Math.min(3, blocks.length);
+  const maValues = winRates.map((_, i) => {{
+    const start = Math.max(0, i - maWindow + 1);
+    const slice = winRates.slice(start, i + 1);
+    return +(slice.reduce((a, b) => a + b, 0) / slice.length).toFixed(1);
+  }});
+  const labels = blocks.map(b => b.label);
+
+  Plotly.react('ch-blocks', [
+    // Bars
+    {{
+      type: 'bar',
+      x: labels,
+      y: winRates,
+      marker: {{
+        color:   blocks.map(b => wrColor(b.win_rate)),
+        opacity: blocks.map(b => b.partial ? 0.45 : 0.78),
+      }},
+      text: blocks.map(b => b.win_rate.toFixed(0) + '%  (' + b.wins + '/' + b.runs + ')'),
+      textposition: 'outside',
+      textfont: {{ color: '#4a4d60', size: 11 }},
+      customdata: blocks.map(b => [b.wins, b.runs]),
+      hovertemplate: '<b>%{{x}}</b><br>%{{customdata[0]}}/%{{customdata[1]}} wins · %{{y:.1f}}%<extra></extra>',
+      cliponaxis: false,
+      showlegend: false,
+    }},
+    // Moving average line
+    {{
+      type: 'scatter', mode: 'lines+markers',
+      x: labels, y: maValues,
+      line: {{ color: '#7c6af7', width: 2.5, shape: 'spline', smoothing: 0.8 }},
+      marker: {{ color: '#7c6af7', size: 7, symbol: 'circle',
+                 line: {{ color: '#fff', width: 1 }} }},
+      hovertemplate: '<b>%{{x}}</b><br>Moving avg: <b>%{{y:.1f}}%</b><extra></extra>',
+      showlegend: false,
+    }},
+  ], {{
+    ...L, height: 260,
+    margin: {{ t: 16, b: 44, l: 50, r: 20 }},
+    xaxis: {{ ...L.xaxis, tickfont: {{ color: '#8880aa', size: 12 }} }},
+    yaxis: {{
+      gridcolor: 'rgba(255,255,255,0.04)',
+      tickfont: {{ color: '#c8c8d8', size: 11 }},
+      autorange: false,
+      range: [0, 110],
+      dtick: 20,
+      title: {{ text: 'Win rate %', font: {{ color: '#3a3d55', size: 11 }} }},
+    }},
+  }}, CFG);
+}}
+
+// ── Progress: rolling win rate line ──────────────────────────────
 function renderProgress() {{
   const prog = d().progress || [];
-  if (prog.length < 2) {{
-    document.getElementById('ch-progress').innerHTML = '<p class="empty">Not enough data</p>';
-    return;
-  }}
-  const n = prog.length;
-  const windowSize = Math.min(20, n);
-  document.getElementById('progress-note').textContent = windowSize + '-run rolling average';
+  const el = document.getElementById('ch-progress');
+  if (prog.length < 2) {{ el.innerHTML = '<p class="empty">Not enough data</p>'; return; }}
 
-  // Color each line segment by whether rolling WR is above/below 50
-  const color = '#7c6af7';
-  Plotly.newPlot('ch-progress', [
-    // 50% reference line
+  const n = prog.length;
+  Plotly.react('ch-progress', [
+    // 50% reference
     {{ type:'scatter', mode:'lines',
        x:[1, n], y:[50, 50],
-       line:{{ color:'rgba(255,255,255,0.08)', width:1, dash:'dot' }},
+       line:{{ color:'rgba(255,255,255,0.07)', width:1, dash:'dot' }},
        hoverinfo:'skip', showlegend:false }},
-    // Shaded area
+    // Area fill
     {{ type:'scatter', mode:'none',
        x: prog.map(p => p.i), y: prog.map(p => p.rolling_wr),
        fill:'tozeroy', fillcolor:'rgba(124,106,247,0.07)',
        hoverinfo:'skip', showlegend:false }},
-    // Rolling win rate line
+    // Line
     {{ type:'scatter', mode:'lines',
        x: prog.map(p => p.i), y: prog.map(p => p.rolling_wr),
-       line:{{ color, width: 2.5, shape:'spline', smoothing:0.6 }},
+       line:{{ color:'#7c6af7', width:2.5, shape:'spline', smoothing:0.5 }},
        customdata: prog.map(p => p.date),
        hovertemplate: 'Run %{{x}}<br>%{{customdata}}<br>Rolling WR: <b>%{{y:.1f}}%</b><extra></extra>',
        showlegend:false }},
-    // Win/loss dots along the bottom
-    {{ type:'scatter', mode:'markers',
-       x: prog.filter(p=>p.win).map(p=>p.i),
-       y: prog.filter(p=>p.win).map(()=>2),
-       marker:{{ color:WIN_COLOR, size:4, opacity:0.6 }},
-       hoverinfo:'skip', showlegend:false }},
-    {{ type:'scatter', mode:'markers',
-       x: prog.filter(p=>!p.win).map(p=>p.i),
-       y: prog.filter(p=>!p.win).map(()=>2),
-       marker:{{ color:LOSS_COLOR, size:4, opacity:0.4 }},
-       hoverinfo:'skip', showlegend:false }},
   ], {{
-    ...L, height: 320,
-    margin:{{ t:8, b:50, l:50, r:30 }},
-    xaxis:{{ ...L.xaxis, title:{{ text:'Run #', font:{{ color:'#3a3d55', size:11 }} }} }},
-    yaxis:{{ ...L.yaxis,
-      range:[0, Math.max(100, Math.max(...prog.map(p=>p.rolling_wr))*1.1)],
-      title:{{ text:'Win rate %', font:{{ color:'#3a3d55', size:11 }} }} }},
+    ...L, height: 260,
+    margin: {{ t: 8, b: 44, l: 50, r: 20 }},
+    xaxis: {{ ...L.xaxis, range: [1, n],
+      title: {{ text: 'Run #', font: {{ color: '#3a3d55', size: 11 }} }} }},
+    yaxis: {{
+      gridcolor: 'rgba(255,255,255,0.04)',
+      tickfont: {{ color: '#c8c8d8', size: 11 }},
+      autorange: false,
+      range: [0, 105],
+      dtick: 20,
+      title: {{ text: 'Win rate %', font: {{ color: '#3a3d55', size: 11 }} }},
+    }},
   }}, CFG);
 }}
 
-// ── Ascension breakdown ──────────────────────────────────────────
-function renderAscension() {{
-  const rows = d().asc_stats || [];
-  const el = document.getElementById('ch-ascension');
+// ── Run history streak widget ────────────────────────────────────
+function renderStreakWidget() {{
+  const prog = d().progress || [];
+  const el = document.getElementById('ch-streak');
+  if (!prog.length) {{ el.innerHTML = '<p class="empty">Not enough data</p>'; return; }}
+
+  // Current streak (from end)
+  const lastWin = prog[prog.length - 1].win;
+  let curStreak = 0;
+  for (let i = prog.length - 1; i >= 0 && prog[i].win === lastWin; i--) curStreak++;
+
+  // Best win streak
+  let bestStreak = 0, run = 0;
+  for (const p of prog) {{
+    run = p.win ? run + 1 : 0;
+    bestStreak = Math.max(bestStreak, run);
+  }}
+
+  // Win rate last 10
+  const last10 = prog.slice(-10);
+  const wr10 = last10.length ? +(last10.filter(p => p.win).length / last10.length * 100).toFixed(0) : 0;
+
+  // Dot grid — most recent 50
+  const recent = prog.slice(-50);
+  const streakStart = recent.length - curStreak;
+  const dots = recent.map((p, i) => {{
+    const inStreak = i >= streakStart;
+    const color = p.win ? 'color:#22c55e' : 'color:#ef4444';
+    const cls = 'run-dot ' + (p.win ? 'win' : 'loss') + (inStreak ? ' in-streak' : '');
+    return `<div class="${{cls}}" style="${{color}}" title="${{p.win ? '✓ Win' : '✗ Loss'}}${{p.date ? ' · ' + p.date : ''}}"></div>`;
+  }}).join('');
+
+  const numClass = lastWin ? 'streak-num good' : 'streak-num bad';
+  const streakLabel = (lastWin ? '🔥 Win' : '💀 Loss') + ' streak';
+
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:20px">
+      <div class="streak-stat">
+        <div class="${{numClass}}">${{curStreak}}</div>
+        <div class="streak-label">${{streakLabel}}</div>
+      </div>
+      <div class="streak-stat">
+        <div class="streak-num">${{bestStreak}}</div>
+        <div class="streak-label">Best win streak</div>
+      </div>
+      <div class="streak-stat">
+        <div class="streak-num" style="background:${{wr10>=50?'linear-gradient(135deg,#22c55e,#06b6d4)':'linear-gradient(135deg,#ef4444,#f59e0b)'}};-webkit-background-clip:text">${{wr10}}%</div>
+        <div class="streak-label">Last 10 win rate</div>
+      </div>
+    </div>
+    <div class="streak-grid">${{dots}}</div>
+    <div style="display:flex;justify-content:space-between;margin-top:10px">
+      <span style="font-size:10px;color:#2a2d42;letter-spacing:0.5px">← older</span>
+      <span style="font-size:10px;color:#2a2d42;letter-spacing:0.5px">recent →</span>
+    </div>`;
+}}
+
+// ── Act progression ──────────────────────────────────────────────
+function renderActProgression() {{
+  const rows = d().act_progression || [];
+  const el = document.getElementById('ch-acts');
   if (!rows.length) {{ el.innerHTML = '<p class="empty">No data</p>'; return; }}
-  const charColor = CHAR_COLORS[activeChar] || '#7c6af7';
-  hbar('ch-ascension',
-    rows.map(r => r.ascension),
-    rows.map(r => r.win_rate),
-    rows.map(r => r.win_rate.toFixed(1) + '%  · ' + r.runs),
-    rows.map(r => charColor),
-    'Win rate %',
-    Math.max(200, rows.length * 52 + 60)
-  );
-}}
 
-// ── Deck size distribution ───────────────────────────────────────
-function renderDeckSize() {{
-  const runs = d().run_lengths || [];
-  // run_lengths doesn't have deck_size — use floors as proxy for engagement
-  // Instead, get deck size from summary or approximate from raw
-  // We'll compute histogram from floors as a proxy isn't right.
-  // Actually, let's just show floors distribution per outcome in a box plot
-  const floors = d().floors || [];
-  if (!floors.length) {{ document.getElementById('ch-decksize').innerHTML = '<p class="empty">No data</p>'; return; }}
-  const winFloors  = floors.filter(r => r.win).map(r => r.floors);
-  const lossFloors = floors.filter(r => !r.win).map(r => r.floors);
-  Plotly.newPlot('ch-decksize', [
-    {{ type:'box', y: winFloors,  name:'Win',
-       marker:{{ color: WIN_COLOR }}, line:{{ color: WIN_COLOR }},
-       fillcolor:'rgba(34,197,94,0.15)',
-       hovertemplate: '%{{y}} floors<extra>Win</extra>' }},
-    {{ type:'box', y: lossFloors, name:'Loss',
-       marker:{{ color: LOSS_COLOR }}, line:{{ color: LOSS_COLOR }},
-       fillcolor:'rgba(239,68,68,0.1)',
-       hovertemplate: '%{{y}} floors<extra>Loss</extra>' }},
-  ], {{
-    ...L, showlegend: true, height: 280,
-    margin:{{ t:8, b:36, l:50, r:20 }},
-    legend:{{ x:0.7, y:0.96, bgcolor:'rgba(0,0,0,0)', font:{{ color:'#888', size:12 }} }},
-    yaxis:{{ ...L.yaxis, title:{{ text:'Floors reached', font:{{ color:'#3a3d55', size:11 }} }} }},
-  }}, CFG);
+  const colors = ['#4fa3e0', '#b06ae8', '#22c55e'];
+  hbar('ch-acts',
+    rows.map(r => r.label),
+    rows.map(r => r.pct),
+    rows.map(r => r.pct.toFixed(1) + '%  (' + r.count + ' runs)'),
+    colors.slice(0, rows.length),
+    '% of runs',
+    Math.max(180, rows.length * 56 + 60)
+  );
 }}
 
 // ── Render all ───────────────────────────────────────────────────
@@ -909,9 +1106,10 @@ function renderAll() {{
   renderRunLength();
   renderRunScatter();
   renderKillers();
+  renderBlocks();
   renderProgress();
-  renderAscension();
-  renderDeckSize();
+  renderStreakWidget();
+  renderActProgression();
 }}
 
 // ── Character buttons ────────────────────────────────────────────
@@ -942,11 +1140,11 @@ function toggleShort() {{
   renderAll();
 }}
 
-// ── Toggle: low ascension exclusion ─────────────────────────────
+// ── Toggle: A10-only filter ──────────────────────────────────────
 function toggleAsc() {{
   inclLowAsc = !inclLowAsc;
   const btn = document.getElementById('asc-btn');
-  btn.textContent = inclLowAsc ? 'All asc included' : 'Low asc excluded';
+  btn.textContent = inclLowAsc ? 'All asc included' : 'A10 only';
   btn.classList.toggle('on-red', inclLowAsc);
   renderAll();
 }}

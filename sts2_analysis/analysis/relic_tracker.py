@@ -17,6 +17,8 @@ def relic_win_rates(runs: list[Run], min_runs: int = 5) -> pd.DataFrame:
          "wins": relic_wins[r], "win_rate": round(relic_wins[r] / relic_runs[r] * 100, 1)}
         for r in relic_runs if relic_runs[r] >= min_runs
     ]
+    if not records:
+        return pd.DataFrame(columns=["relic", "runs", "wins", "win_rate"])
     return pd.DataFrame(records).sort_values("win_rate", ascending=False)
 
 
@@ -31,10 +33,13 @@ def relic_frequency(runs: list[Run]) -> pd.DataFrame:
 
 
 def floor_acquired(runs: list[Run]) -> pd.DataFrame:
-    """When (which floor) relics are typically acquired."""
+    """When (which floor) relics are typically acquired. Filters out starter relics (floor=0)."""
     records = []
     for run in runs:
         for relic in run.relics:
+            # Skip starter relics at floor 0 to avoid distorting "when acquired" histograms (CORRUPT-7)
+            if relic.floor_added_to_deck == 0:
+                continue
             records.append({
                 "relic": relic.id.replace("RELIC.", ""),
                 "floor": relic.floor_added_to_deck,
